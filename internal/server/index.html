@@ -792,6 +792,26 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
+  // Every request to the app gives up after a second: on a LAN the answer
+  // takes milliseconds, and an app that has gone (a phone asleep, a
+  // computer switched off) must show as unreachable, not freeze the page.
+  // Commands are not sent again: the first may have reached the speakers
+  // and only its answer be late. The status and the log are asked for
+  // again anyway, every second or so.
+  const CALL_TIMEOUT = 1000;
+  function call(url, opts = {}) {
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), CALL_TIMEOUT); // also bounds reading the body
+    return fetch(url, { ...opts, signal: ctl.signal });
+  }
+  // What is loaded once (the device list, the addresses) is tried twice.
+  async function load(url) {
+    try {
+      const res = await call(url);
+      if (res.status < 500) return res;
+    } catch { /* once more */ }
+    return call(url);
+  }
   const conn = $('conn'), connText = $('connText');
   const volBar = $('volBar'), volText = $('volText'), ir = $('ir');
   const msgEl = $('msg'), dlg = $('confirm'), logDlg = $('log');
@@ -869,7 +889,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
     const cmd = btn.dataset.cmd;
     flash();
     try {
-      const res = await fetch('/api/' + encodeURIComponent(cmd), { method: 'POST' });
+      const res = await call('/api/' + encodeURIComponent(cmd), { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (data.success) {
         say(cmd === 'reconnect' ? 'Reconnecting' : 'Sent');
@@ -889,7 +909,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 
   async function refresh() {
     try {
-      const data = await (await fetch('/api/status')).json();
+      const data = await (await call('/api/status')).json();
       api(true);
       showConn(...(PHASES[data.phase] || ['', 'Not connected']));
       const released = data.phase === 'released';
@@ -965,7 +985,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
     if (logBusy) return;
     logBusy = true;
     try {
-      const res = await fetch('/api/log?after=' + logNext);
+      const res = await call('/api/log?after=' + logNext);
       if (!res.ok) return;
       const data = await res.json();
       if (data.next < logNext) { // the app was restarted: start over
@@ -1053,7 +1073,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 
   async function loadPeers() {
     try {
-      const data = await (await fetch('/api/peers')).json();
+      const data = await (await load('/api/peers')).json();
       peers = data.peers || [];
       peersFixed = !!data.fixed;
       showPeers();
@@ -1065,7 +1085,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 
   async function savePeers(list, done) {
     try {
-      const res = await fetch('/api/peers?list=' + encodeURIComponent(list.join(',')), { method: 'POST' });
+      const res = await call('/api/peers?list=' + encodeURIComponent(list.join(',')), { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!data.success) {
         peersNote(data.error || 'Could not save', true);
@@ -1115,7 +1135,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
     }
     flash();
     try {
-      const data = await (await fetch('/api/takeover', { method: 'POST' })).json();
+      const data = await (await call('/api/takeover', { method: 'POST' })).json();
       if (data.success) {
         say('Asking again');
         setTimeout(refresh, 400);
@@ -1214,7 +1234,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 
   async function loadAddrs() {
     try {
-      const res = await fetch('/api/addrs');
+      const res = await load('/api/addrs');
       const urls = res.ok ? (await res.json()).urls || [] : [];
       const list = $('webList');
       list.replaceChildren(...urls.map((url) => {

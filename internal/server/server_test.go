@@ -310,3 +310,23 @@ func TestLogPollIsNotLogged(t *testing.T) {
 		t.Fatalf("not logged: %s", buf.String())
 	}
 }
+
+// Asked twice, an app that let go already has nothing to give: it says so
+// and does not let go again.
+func TestDisconnectTwice(t *testing.T) {
+	sp := &fakeSpeaker{connected: true}
+	h := New(sp, quiet)
+	if rec := do(h, "POST", "/api/disconnect"); rec.Code != 200 || rec.Body.String() != "{\"success\":true}\n" {
+		t.Fatalf("first: %d %s", rec.Code, rec.Body)
+	}
+	for i := 0; i < 100 && len(sp.got()) == 0; i++ {
+		time.Sleep(10 * time.Millisecond) // Release runs in the background
+	}
+	if rec := do(h, "POST", "/api/disconnect"); rec.Code != 200 || rec.Body.String() != "{\"held\":false,\"success\":true}\n" {
+		t.Fatalf("second: %d %s", rec.Code, rec.Body)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if g := sp.got(); len(g) != 1 || g[0] != "Release" {
+		t.Fatalf("calls=%v", g)
+	}
+}

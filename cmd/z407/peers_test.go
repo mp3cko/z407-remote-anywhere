@@ -87,7 +87,9 @@ func TestDisconnectRequestKeepsTheAppOpen(t *testing.T) {
 func TestTakeoverWaitsWhileReleasedAndAsksAgainAfterReconnect(t *testing.T) {
 	var hits atomic.Int32
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		if r.Method == http.MethodPost { // not the state check before it
+			hits.Add(1)
+		}
 		_, _ = w.Write([]byte(`{"success":true}`))
 	}))
 	defer peer.Close()
@@ -126,7 +128,9 @@ func TestTakeoverWaitsWhileReleasedAndAsksAgainAfterReconnect(t *testing.T) {
 func TestAskAgainFromThePage(t *testing.T) {
 	var hits atomic.Int32
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		if r.Method == http.MethodPost { // not the state check before it
+			hits.Add(1)
+		}
 		w.WriteHeader(http.StatusConflict) // looking for the speakers itself
 	}))
 	defer peer.Close()
@@ -320,7 +324,8 @@ func TestTakeoverAsksPeersAtStart(t *testing.T) {
 	a.stillRunning(100 * time.Millisecond) // it keeps searching
 	mu.Lock()
 	defer mu.Unlock()
-	if !reflect.DeepEqual(hits, []string{"POST /api/disconnect"}) {
+	// First its state: one that let go already would not be asked.
+	if !reflect.DeepEqual(hits, []string{"GET /api/status", "POST /api/disconnect"}) {
 		t.Fatalf("peer got %v", hits)
 	}
 	if !strings.Contains(a.out.String(), "Asked "+peerAddr+" to release the speakers (new session)") {

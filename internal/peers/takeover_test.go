@@ -3,6 +3,7 @@ package peers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,8 +19,10 @@ import (
 // peerServer is another instance of the app, as far as takeover can tell.
 type peerServer struct {
 	*httptest.Server
-	mu   sync.Mutex
-	hits []string // "METHOD path"
+	mu    sync.Mutex
+	hits  []string // "METHOD path", but for the state checks
+	phase string   // what GET /api/status reports; "" = connected
+	looks int      // state checks
 }
 
 func newPeer(t *testing.T) *peerServer {
@@ -27,9 +30,19 @@ func newPeer(t *testing.T) *peerServer {
 	p := &peerServer{}
 	p.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
-		p.hits = append(p.hits, r.Method+" "+r.URL.Path)
-		p.mu.Unlock()
+		defer p.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/api/status" {
+			p.looks++
+			phase := p.phase
+			if phase == "" {
+				phase = "connected"
+			}
+			_, _ = w.Write([]byte(`{"connected":` + fmt.Sprint(phase == "connected") + `,"phase":"` + phase + `"}` + "\n"))
+			return
+		}
+		p.hits = append(p.hits, r.Method+" "+r.URL.Path)
+		// As versions before "held" did: success, also when let go already.
 		_, _ = w.Write([]byte(`{"success":true}` + "\n"))
 	}))
 	t.Cleanup(p.Close)
@@ -37,6 +50,11 @@ func newPeer(t *testing.T) *peerServer {
 }
 
 func (p *peerServer) addr() string { return strings.TrimPrefix(p.URL, "http://") }
+func (p *peerServer) checks() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.looks
+}
 func (p *peerServer) got() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -391,6 +409,10 @@ func TestNotesTellWhatIsGoingOn(t *testing.T) {
 	}{
 		{`200 {"success":true}`, nil, "desk:5000 released the speakers"},
 		{`501 {"success":false}`, nil, "desk:5000 did not release the speakers"},
+		// Let go already, or still looking itself: it had nothing to give.
+		{`200 {"held":false,"success":true}`, nil, "desk:5000 did not have the speakers"},
+		{`409 {"error":"This device does not hold the speakers: it is looking for them itself","success":false}`, nil,
+			"desk:5000 did not have the speakers"},
 		{"", errors.New("connection refused"), "desk:5000 did not answer"},
 	} {
 		r := newRig("desk:5000")
@@ -437,6 +459,9 @@ func TestNotesSumUpARound(t *testing.T) {
 		{map[string]string{"a:5000": "200 ok", "b:5000": "", "c:5000": "200 ok"}, "a:5000 and c:5000 released the speakers"},
 		{map[string]string{"a:5000": "501 no", "b:5000": "", "c:5000": ""}, "a:5000 did not release the speakers"},
 		{map[string]string{"a:5000": "", "b:5000": "", "c:5000": ""}, "No other device answered"},
+		{map[string]string{"a:5000": "409 no", "b:5000": `200 {"held":false}`, "c:5000": ""}, "a:5000 and b:5000 did not have the speakers"},
+		{map[string]string{"a:5000": "409 no", "b:5000": "200 ok", "c:5000": ""}, "b:5000 released the speakers"},
+		{map[string]string{"a:5000": "409 no", "b:5000": "501 no", "c:5000": ""}, "b:5000 did not release the speakers"},
 	} {
 		r := newRig("a:5000", "b:5000", "c:5000")
 		var notes []string
@@ -510,5 +535,64 @@ func TestAgainWhileConnectedAsksNobody(t *testing.T) {
 	r.advance(time.Second)
 	if len(p.got()) != 1 {
 		t.Fatalf("asked: %v", p.got())
+	}
+}
+
+// A peer that let go already is not asked, whatever version it runs: older
+// ones answer the request as if they had let go, and the note would say so.
+func TestPeerThatLetGoAlreadyIsNotAsked(t *testing.T) {
+	held, free := newPeer(t), newPeer(t)
+	free.phase = "released"
+	r := newRig(held.addr(), free.addr())
+	var notes []string
+	r.Note = func(s string) { notes = append(notes, s) }
+	r.advance(0)
+	if !reflect.DeepEqual(held.got(), disconnect) || len(free.got()) != 0 {
+		t.Fatalf("held got %v, free got %v", held.got(), free.got())
+	}
+	if held.checks() != 1 || free.checks() != 1 {
+		t.Fatalf("state checks: %d %d", held.checks(), free.checks())
+	}
+	if want := held.addr() + " released the speakers"; notes[len(notes)-1] != want {
+		t.Fatalf("note %q, want %q", notes[len(notes)-1], want)
+	}
+	if !strings.Contains(strings.Join(r.log, "\n"), "had let go of the speakers already, not asked") {
+		t.Fatalf("log: %v", r.log)
+	}
+
+	// Alone, it makes the note say it had nothing to give.
+	r2 := newRig(free.addr())
+	notes = nil
+	r2.Note = func(s string) { notes = append(notes, s) }
+	r2.advance(0)
+	if want := free.addr() + " did not have the speakers"; notes[len(notes)-1] != want {
+		t.Fatalf("note %q, want %q", notes[len(notes)-1], want)
+	}
+	if len(free.got()) != 0 {
+		t.Fatalf("asked: %v", free.got())
+	}
+}
+
+// A peer that does not tell its state (an error, or not this app) is asked
+// all the same.
+func TestPeerPhaseUnknownStillAsks(t *testing.T) {
+	r := newRig("desk:5000")
+	var posted int
+	r.Phase = func(context.Context, string) (string, error) { return "", errors.New("404") }
+	r.Post = func(context.Context, string) (string, error) { posted++; return `200 {"success":true}`, nil }
+	r.advance(0)
+	if posted != 1 {
+		t.Fatalf("posted %d", posted)
+	}
+}
+
+func TestPeerPhase(t *testing.T) {
+	p := newPeer(t)
+	p.phase = "released"
+	if got, err := PeerPhase(context.Background(), p.addr()); err != nil || got != "released" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if _, err := PeerPhase(context.Background(), unreachable(t)); err == nil {
+		t.Fatal("no error for an unreachable peer")
 	}
 }

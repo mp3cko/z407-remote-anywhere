@@ -2,6 +2,8 @@ package peers
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,10 +27,11 @@ const (
 	// seen: setting up the connection takes a moment longer, and a peer must
 	// not be closed for that.
 	ConnectTimeout = 10 * time.Second
-	// PeerTimeout bounds the request to one peer; a computer that is switched
-	// off must not hold up the others. The peers are asked at the same time,
-	// so a round takes at most this long.
-	PeerTimeout = 2 * time.Second
+	// PeerTimeout bounds the requests to one peer (its state, then the
+	// request to let go), together; a computer that is switched off must
+	// not hold up the others. On a LAN the answer takes milliseconds. The
+	// peers are asked at the same time, so a round takes at most this long.
+	PeerTimeout = time.Second
 	// CheckInterval is how often Run looks at the connection state.
 	CheckInterval = time.Second
 )
@@ -58,7 +61,12 @@ type Takeover struct {
 	// Post sends the disconnect request and describes the answer. nil = HTTP.
 	// It is called for several peers at the same time.
 	Post func(ctx context.Context, peer string) (answer string, err error)
-	Log  func(level logx.Level, format string, args ...any)
+	// Phase fetches a peer's phase ("released", ...) before it is asked: one
+	// that let go already has nothing to give and is not asked, whatever
+	// version it runs (older ones answer a request as if they had let go).
+	// nil = over HTTP when Post is nil too, else no check.
+	Phase func(ctx context.Context, peer string) (phase string, err error)
+	Log   func(level logx.Level, format string, args ...any)
 	// Again starts a new session when it delivers: the user asks every peer
 	// once more, also those asked before. nil = never.
 	Again <-chan struct{}
@@ -145,6 +153,7 @@ func (t *Takeover) timeout() time.Duration {
 const (
 	outReleased = iota // let go of the speakers
 	outRefused         // answered, but did not let go
+	outIdle            // answered, but had nothing to let go of
 	outSilent          // did not answer: off, or not running the app
 )
 
@@ -175,6 +184,10 @@ func (t *Takeover) askAll(ctx context.Context, peers []string, first bool) {
 			outcome[i] = out
 			mu.Lock()
 			defer mu.Unlock()
+			if errors.Is(err, errLetGo) {
+				t.logf(logx.Info, "Other devices: %s had let go of the speakers already, not asked", peer)
+				return
+			}
 			if err != nil {
 				// Normal: that computer is off, or the app is not running there.
 				t.logf(logx.Info, "Other devices: %s did not answer (%v)", peer, err)
@@ -220,23 +233,49 @@ func (t *Takeover) ask(ctx context.Context, peer string) (int, string, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	post := t.Post
+	post, phase := t.Post, t.Phase
 	if post == nil {
 		post = PostDisconnect
+		if phase == nil {
+			phase = PeerPhase
+		}
+	}
+	// A peer that cannot tell is asked all the same.
+	if phase != nil {
+		if p, err := phase(ctx, peer); err == nil && p == "released" {
+			return outIdle, "", errLetGo
+		}
 	}
 	answer, err := post(ctx, peer)
 	switch {
 	case err != nil:
 		return outSilent, "", err
-	case strings.HasPrefix(answer, "200"):
-		return outReleased, answer, nil
 	default:
-		return outRefused, answer, nil
+		return outcomeOf(answer), answer, nil
+	}
+}
+
+// outcomeOf classifies an answer such as `200 {"success":true}`. A peer that
+// is still looking for the speakers refuses with 409, and one that had let
+// go of them already answers `"held":false`: neither had them to give.
+func outcomeOf(answer string) int {
+	code, body, _ := strings.Cut(answer, " ")
+	var r struct {
+		Held *bool `json:"held"`
+	}
+	_ = json.Unmarshal([]byte(body), &r) // older versions and other answers: no "held"
+	switch {
+	case code == "409", code == "200" && r.Held != nil && !*r.Held:
+		return outIdle
+	case code == "200":
+		return outReleased
+	default:
+		return outRefused
 	}
 }
 
 // outcomeText sums up a round in one note: who released the speakers, else
-// who would not, else who did not answer.
+// who would not, else who did not have them, else who did not answer.
 func outcomeText(peers []string, outcome []int) string {
 	by := map[int][]string{}
 	for i, p := range peers {
@@ -247,6 +286,8 @@ func outcomeText(peers []string, outcome []int) string {
 		return joinNames(by[outReleased]) + " released the speakers"
 	case len(by[outRefused]) > 0:
 		return joinNames(by[outRefused]) + " did not release the speakers"
+	case len(by[outIdle]) > 0:
+		return joinNames(by[outIdle]) + " did not have the speakers"
 	case len(peers) == 1:
 		return peers[0] + " did not answer"
 	default:
@@ -286,6 +327,32 @@ func (t *Takeover) Run(ctx context.Context, interval time.Duration) {
 			t.again = true
 		}
 	}
+}
+
+// errLetGo: the peer had let go of the speakers already and was not asked.
+var errLetGo = errors.New("had let go already")
+
+// PeerPhase fetches GET /api/status from peer and returns its phase.
+func PeerPhase(ctx context.Context, peer string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+peer+"/api/status", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var s struct {
+		Phase string `json:"phase"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&s); err != nil {
+		return "", err
+	}
+	return s.Phase, nil
 }
 
 // PostDisconnect sends POST /api/disconnect to peer and returns its answer, e.g.

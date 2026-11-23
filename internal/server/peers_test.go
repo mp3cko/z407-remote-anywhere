@@ -157,8 +157,8 @@ type slowRelease struct {
 func (s slowRelease) Release() { <-s.block }
 
 // An app that has not seen the speakers has nothing to let go of: it says
-// so and goes on looking. One that is setting up the connection, or has
-// let go already, does what it is asked.
+// so and goes on looking. One that is setting up the connection does what
+// it is asked; one that let go already says it had nothing to give.
 func TestDisconnectOnlyWhenHolding(t *testing.T) {
 	for _, c := range []struct {
 		sp      *fakeSpeaker
@@ -168,7 +168,7 @@ func TestDisconnectOnlyWhenHolding(t *testing.T) {
 		{&fakeSpeaker{phase: "searching"}, 409, false},
 		{&fakeSpeaker{}, 409, false}, // between attempts
 		{&fakeSpeaker{phase: "connecting"}, 200, true},
-		{&fakeSpeaker{phase: "released"}, 200, true},
+		{&fakeSpeaker{phase: "released"}, 200, false},
 		{&fakeSpeaker{connected: true}, 200, true},
 	} {
 		rec := do(New(c.sp, quiet), "POST", "/api/disconnect")
@@ -214,7 +214,7 @@ func TestDisconnectAnswersFirst(t *testing.T) {
 
 func TestPeersEditorInPage(t *testing.T) {
 	page := do(New(&fakeSpeaker{}, quiet), "GET", "/").Body.String()
-	for _, w := range []string{`id="devOpen"`, `<dialog id="devices"`, "fetch('/api/peers')", "'/api/peers?list=' + encodeURIComponent("} {
+	for _, w := range []string{`id="devOpen"`, `<dialog id="devices"`, "load('/api/peers')", "'/api/peers?list=' + encodeURIComponent("} {
 		if !strings.Contains(page, w) {
 			t.Errorf("page lacks %q", w)
 		}

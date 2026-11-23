@@ -264,9 +264,17 @@ func (s *srv) savePeers(w http.ResponseWriter, r *http.Request) {
 // An app that has not even seen the speakers holds nothing to let go of. It
 // refuses and goes on looking: two copies that start at the same moment ask
 // each other at once, and if both let go, neither connects.
+//
+// One that let go already says so ("held": false): it had nothing to give,
+// and the asker must not report that it released the speakers.
 func (s *srv) disconnect(w http.ResponseWriter, _ *http.Request) {
 	connected, _ := s.sp.Status()
-	if phase, _ := s.sp.Progress(); !connected && phase != "connecting" && phase != "released" {
+	phase, _ := s.sp.Progress()
+	if phase == "released" {
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "held": false})
+		return
+	}
+	if !connected && phase != "connecting" {
 		s.log.Infof("Another device asked for the speakers, but this one does not hold them: looking for them on")
 		writeJSON(w, http.StatusConflict, map[string]any{"success": false, "error": notHoldingMsg})
 		return

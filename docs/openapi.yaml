@@ -116,13 +116,23 @@ paths:
 
         An app that is still looking for the speakers itself, without
         having seen them, holds nothing to let go of: it refuses and goes
-        on looking.
+        on looking. One that has let go already answers `200` with
+        `"held": false`: it had nothing to give, and the asker does not
+        report that it released the speakers.
       responses:
         "200":
-          description: The app is letting go (or has let go already).
+          description: "The app is letting go, or (`held` false) had let go already."
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Success" }
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success: { type: boolean, const: true }
+                  held:
+                    type: boolean
+                    const: false
+                    description: Present only when the app had let go of the speakers already.
         "409":
           description: The app does not hold the speakers; it goes on looking for them.
           content:
