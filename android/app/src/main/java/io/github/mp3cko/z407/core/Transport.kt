@@ -2,6 +2,9 @@ package io.github.mp3cko.z407.core
 
 import java.io.IOException
 
+/** No speaker was seen while scanning (Go: speaker.ErrNotFound). */
+class NotFoundException : IOException("Z407 speaker not found")
+
 /** Events a [Link] reports. They may arrive on any thread. */
 interface LinkEvents {
     /** Called during the dial, once the speakers have been seen and the connection to them begins. */

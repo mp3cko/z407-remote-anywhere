@@ -36,6 +36,11 @@ class SpeakerManager(
         const val PHASE_SEARCHING = "searching" // looking for the speakers
         const val PHASE_CONNECTING = "connecting" // found them, setting up the connection
         const val PROBLEM_CONNECT = "Could not connect"
+        /**
+         * As the desktop app says it; the page offers to ask the other
+         * devices again when it sees this text.
+         */
+        const val PROBLEM_NOT_FOUND = "Speakers not found"
         const val PROBLEM_NO_ANSWER = "Speakers did not answer"
         const val PROBLEM_LOST = "Connection lost"
     }
@@ -159,7 +164,10 @@ class SpeakerManager(
         } catch (e: IOException) {
             logFail("Dial failed: ${e.message}")
             // The dialer's messages are short and plain ("Bluetooth is switched off").
-            failed(e.message?.replaceFirstChar { it.uppercase() } ?: PROBLEM_CONNECT)
+            failed(
+                if (e is NotFoundException) PROBLEM_NOT_FOUND
+                else e.message?.replaceFirstChar { it.uppercase() } ?: PROBLEM_CONNECT,
+            )
             return false
         }
         try {

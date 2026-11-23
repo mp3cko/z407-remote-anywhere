@@ -3,6 +3,7 @@ package io.github.mp3cko.z407.core
 import java.io.IOException
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -170,6 +171,8 @@ class ApiTest {
         )
         check(api.handle("POST", "/api/disconnect", null), 200, "{\"success\":true}\n")
         assertEquals(true, released)
+        // Asked again: it has nothing to give, and says so.
+        check(api.handle("POST", "/api/disconnect", null), 200, "{\"held\":false,\"success\":true}\n")
         // Released: the page says so, whatever the manager is doing, and commands are refused.
         check(api.handle("GET", "/api/status", null), 200, "{\"connected\":false,\"note\":\"\",\"phase\":\"released\",\"problem\":\"\",\"volume\":50}\n")
         assertEquals(404, api.handle("POST", "/api/vol_up", null).status)
@@ -201,6 +204,15 @@ class ApiTest {
         )
         assertEquals(false, released)
         assertEquals(1, logged.size)
+        assertTrue(logged[0].endsWith("looking for them on"))
+    }
+
+    @Test
+    fun disconnectWhileAsleepSaysWhy() {
+        val logged = mutableListOf<String>()
+        val api = Api(SpeakerManager(FakeDialer()), store, asleep = { true }, log = { logged += it })
+        assertEquals(409, api.handle("POST", "/api/disconnect", null).status)
+        assertEquals(listOf("Another device asked for the speakers: this one let go of them when the screen went off"), logged)
     }
 
     @Test

@@ -15,6 +15,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.View
 import android.view.WindowInsets
@@ -182,13 +183,20 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        val opening = remote.visits.started()
         when {
-            Permissions.granted(this) -> connect()
+            Permissions.granted(this) -> connect(opening)
             !askedPermissions -> {
                 askedPermissions = true
                 requestPermissions(Permissions.needed, REQUEST_PERMISSIONS)
             }
         }
+    }
+
+    override fun onStop() {
+        // Hidden by the screen going off, coming back is not an opening.
+        remote.visits.stopped(getSystemService(PowerManager::class.java).isInteractive)
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -199,12 +207,15 @@ class MainActivity : Activity() {
 
     // Only called once the permissions are granted (asking to switch
     // Bluetooth on needs BLUETOOTH_CONNECT on Android 12+).
+    // [opening]: the user opened the app, rather than turned the screen back
+    // on with the app on it; only then are the other devices asked for the
+    // speakers.
     @SuppressLint("MissingPermission")
-    private fun connect() {
+    private fun connect(opening: Boolean = true) {
         // The service connects and keeps the remote working when the app
         // leaves the screen; its notification needs a permission of its own.
         RemoteService.start(this)
-        remote.opened()
+        if (opening) remote.opened()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !askedNotifications &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {

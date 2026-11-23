@@ -31,6 +31,14 @@ class Takeover(
     /** Tells the user, in a few words, what is being done: one note when a round starts, one with its outcome. */
     private val note: (String) -> Unit = {},
     private val foundTimeoutMillis: Long = CONNECT_TIMEOUT_MILLIS,
+    /**
+     * A peer's phase ("released", ...), fetched before it is asked; null =
+     * it cannot tell, IOException = it cannot be reached. One that let go already has nothing to give and is
+     * not asked, whatever version it runs (older ones answer a request as
+     * if they had let go). Called for several peers at the same time.
+     */
+    private val phase: (peer: String) -> String? = { null },
+    private val peerTimeoutMillis: Long = PEER_TIMEOUT_MILLIS.toLong(),
 ) {
     companion object {
         /**
@@ -46,27 +54,50 @@ class Takeover(
          */
         const val CONNECT_TIMEOUT_MILLIS = 10_000L
         /**
-         * Bounds the request to one peer; a computer that is off must not
-         * hold up the others. The peers are asked at the same time, so a
-         * round takes about this long at most.
+         * Bounds the requests to one peer (its state, then the request to
+         * let go), together; a computer that is off must not hold up the
+         * others. On a LAN the answer takes milliseconds. The peers are
+         * asked at the same time, so a round takes at most this long.
          */
-        const val PEER_TIMEOUT_MILLIS = 2_000
+        const val PEER_TIMEOUT_MILLIS = 1_000
         const val CHECK_INTERVAL_MILLIS = 1_000L
 
         private const val RELEASED = 0
         private const val REFUSED = 1
         private const val SILENT = 2
+        /** Answered, but had nothing to let go of. */
+        private const val IDLE = 3
+
+        private val PHASE = Regex("\"phase\"\\s*:\\s*\"([^\"]*)\"")
+
+        /** The phase in a body of GET /api/status, or null. */
+        fun phaseOf(status: String): String? = PHASE.find(status)?.groupValues?.get(1)
+
+        private val NOT_HELD = Regex("\"held\"\\s*:\\s*false")
+
+        /**
+         * Classifies an answer such as `200 {"success":true}`. A peer still
+         * looking for the speakers refuses with 409, and one that had let go
+         * of them already answers `"held":false`: neither had them to give.
+         */
+        internal fun outcomeOf(answer: String): Int = when {
+            answer.startsWith("409") -> IDLE
+            answer.startsWith("200") && NOT_HELD.containsMatchIn(answer) -> IDLE
+            answer.startsWith("200") -> RELEASED
+            else -> REFUSED
+        }
 
         /** "a", "a and b", "a, b and c". */
         private fun joinNames(names: List<String>): String =
             if (names.size == 1) names[0] else names.dropLast(1).joinToString(", ") + " and " + names.last()
 
-        /** One note for a round: who released the speakers, else who would not, else who did not answer. */
+        /** One note for a round: who released the speakers, else who would not, else who did not have them, else who did not answer. */
         internal fun outcomeText(peers: List<String>, outcome: IntArray): String {
             val by = peers.indices.groupBy({ outcome[it] }, { peers[it] })
             return when {
                 by[RELEASED] != null -> joinNames(by.getValue(RELEASED)) + " released the speakers"
                 by[REFUSED] != null -> joinNames(by.getValue(REFUSED)) + " did not release the speakers"
+                by[IDLE] != null -> joinNames(by.getValue(IDLE)) + " did not have the speakers"
                 peers.size == 1 -> "${peers[0]} did not answer"
                 else -> "No other device answered"
             }
@@ -82,6 +113,17 @@ class Takeover(
     fun newSession() {
         searching = false
         asked = null
+    }
+
+    /**
+     * Starts afresh without asking anyone: the screen came back on. The
+     * speakers are taken if they are free, but not from a device that took
+     * them while the phone slept; peers added later are still asked once
+     * the speakers have not shown up within the timeout.
+     */
+    fun quietSession() {
+        searching = false
+        asked = HashSet(peers())
     }
 
     /** Looks at the state at [nowMillis] (a monotonic clock) and asks the peers when due. */
@@ -108,26 +150,49 @@ class Takeover(
         val why = if (first) "new session" else "speakers not found"
         val outcome = IntArray(round.size) { SILENT }
         val lines = arrayOfNulls<String>(round.size)
+        val lock = Object()
+        var over = false // the time is up: late answers are dropped
+        fun result(i: Int, out: Int, line: String) = synchronized(lock) {
+            if (!over) {
+                outcome[i] = out
+                lines[i] = line
+            }
+        }
         val threads = round.mapIndexed { i, peer ->
             Thread({
                 try {
+                    if (phase(peer) == "released") {
+                        result(i, IDLE, "Other devices: $peer had let go of the speakers already, not asked")
+                        return@Thread
+                    }
                     val answer = post(peer)
-                    outcome[i] = if (answer.startsWith("200")) RELEASED else REFUSED
-                    lines[i] = "Asked $peer to release the speakers ($why): $answer"
+                    result(i, outcomeOf(answer), "Asked $peer to release the speakers ($why): $answer")
                 } catch (e: IOException) {
                     // Normal: that computer is off, or the app is not running there.
-                    lines[i] = "Other devices: $peer did not answer (${e.message})"
+                    result(i, SILENT, "Other devices: $peer did not answer (${e.message})")
                 } catch (e: Exception) {
                     // Uncaught, it would end the app.
-                    lines[i] = "Other devices: could not ask $peer ($e)"
+                    result(i, SILENT, "Other devices: could not ask $peer ($e)")
                 }
-            }, "z407-ask").apply { start() }
+            }, "z407-ask").apply {
+                isDaemon = true
+                start()
+            }
         }
+        // Each request has timeouts of its own, but two in a row could take
+        // twice as long: the round as a whole ends on time.
+        val deadline = System.nanoTime() + peerTimeoutMillis * 1_000_000
         try {
-            threads.forEach { it.join() }
+            threads.forEach { it.join(maxOf(1, (deadline - System.nanoTime()) / 1_000_000)) }
         } catch (e: InterruptedException) {
             threads.forEach { it.interrupt() }
             throw e // disconnect(): no outcome to tell
+        }
+        synchronized(lock) {
+            over = true
+            round.forEachIndexed { i, peer ->
+                if (threads[i].isAlive && lines[i] == null) lines[i] = "Other devices: $peer did not answer within ${peerTimeoutMillis} ms"
+            }
         }
         lines.forEach { if (it != null) log(it) }
         note(outcomeText(round, outcome))

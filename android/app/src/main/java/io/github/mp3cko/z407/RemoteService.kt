@@ -5,14 +5,17 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import io.github.mp3cko.z407.core.Summary
 
@@ -21,6 +24,8 @@ import io.github.mp3cko.z407.core.Summary
  * the speakers, and the server other devices reach the remote through. A
  * foreground service, so Android lets it live; its notification says how
  * things stand, carries the keys used most, and opens the app when tapped.
+ *
+ * While the screen is off it lets go of the speakers ([Remote.screen]).
  *
  * It runs from the first time the app is opened until the Quit key of the
  * notification is pressed or the app is removed from the list of recent apps.
@@ -33,6 +38,8 @@ class RemoteService : Service() {
         private const val COMMAND = "io.github.mp3cko.z407.COMMAND."
         private const val QUIT = "io.github.mp3cko.z407.QUIT"
         private const val REFRESH_MILLIS = 2_000L
+        /** Bounds the wake lock that lets the app finish letting go of the speakers as the screen goes off. */
+        private const val SCREEN_WAKE_MILLIS = 10_000L
 
         /** Call it while the app is on screen: only then may a foreground service start. */
         fun start(context: Context) {
@@ -47,6 +54,7 @@ class RemoteService : Service() {
     private lateinit var remote: Remote
     private val handler = Handler(Looper.getMainLooper())
     private var shown: Summary? = null
+    private var destroyed = false
     private val refresh = object : Runnable {
         override fun run() {
             val now = remote.summary()
@@ -58,7 +66,47 @@ class RemoteService : Service() {
         }
     }
 
+    /** Screen off: the speakers are let go of; on: looked for again. */
+    private val screenWatch = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            followScreen()
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * Brings the remote in line with the screen. Closing the link takes a
+     * moment, so not on the main thread; the remote reads the screen's state
+     * itself, so the last of several quick calls has the final word.
+     *
+     * With the screen off the phone may suspend at once, before the link is
+     * closed; a short wake lock keeps it awake until the Bluetooth stack has
+     * been told to let go.
+     */
+    private fun followScreen() {
+        val power = getSystemService(PowerManager::class.java)
+        val awake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "z407:screen")
+        awake.acquire(SCREEN_WAKE_MILLIS)
+        Thread({
+            try {
+                remote.screen(power::isInteractive)
+            } finally {
+                // Show it now, before letting the phone sleep: asleep, the
+                // regular refresh would wait for it to wake.
+                handler.post {
+                    try {
+                        if (!destroyed) {
+                            handler.removeCallbacks(refresh)
+                            refresh.run()
+                        }
+                    } finally {
+                        if (awake.isHeld) awake.release()
+                    }
+                }
+            }
+        }, "z407-screen").start()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -67,6 +115,13 @@ class RemoteService : Service() {
         channel.description = getString(R.string.channel_description)
         channel.setShowBadge(false)
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        // System broadcasts sent to registered receivers only; not exported (Android 13+ asks).
+        val screen = IntentFilter(Intent.ACTION_SCREEN_OFF).apply { addAction(Intent.ACTION_SCREEN_ON) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenWatch, screen, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(screenWatch, screen)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -94,6 +149,8 @@ class RemoteService : Service() {
             return START_NOT_STICKY
         }
         shown = summary
+        // Started (or restarted by Android) with the screen off: do not connect.
+        remote.screen(getSystemService(PowerManager::class.java)::isInteractive)
         remote.start()
         intent?.action?.takeIf { it.startsWith(COMMAND) }?.let { remote.press(it.removePrefix(COMMAND)) }
         handler.removeCallbacks(refresh)
@@ -108,6 +165,8 @@ class RemoteService : Service() {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        unregisterReceiver(screenWatch)
         handler.removeCallbacks(refresh)
         remote.stop()
         super.onDestroy()

@@ -31,6 +31,8 @@ class Api(
     private val released: () -> Boolean = { false },
     /** The user asks the other devices for the speakers once more (POST /api/takeover). */
     private val again: () -> Unit = {},
+    /** Whether the screen is off, so the app let go of the speakers and does not look for them. */
+    private val asleep: () -> Boolean = { false },
     private val log: (String) -> Unit = {},
 ) {
     companion object {
@@ -93,9 +95,14 @@ class Api(
      * moment ask each other at once, and if both let go, neither connects.
      */
     private fun disconnectRequest(): ApiResponse {
+        // Let go already: nothing to give, and the asker must not report that it was given.
+        if (released()) return json(200, "held" to false, "success" to true)
         val s = speaker.status()
-        if (!released() && !s.connected && s.phase != SpeakerManager.PHASE_CONNECTING) {
-            log("Another device asked for the speakers, but this one does not hold them: looking for them on")
+        if (!s.connected && s.phase != SpeakerManager.PHASE_CONNECTING) {
+            log(
+                if (asleep()) "Another device asked for the speakers: this one let go of them when the screen went off"
+                else "Another device asked for the speakers, but this one does not hold them: looking for them on",
+            )
             return json(409, "error" to NOT_HOLDING, "success" to false)
         }
         disconnect()

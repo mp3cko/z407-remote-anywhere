@@ -84,6 +84,22 @@ class TakeoverTest {
         assertEquals("a:5000, b:5000 and c:5000 released the speakers", Takeover.outcomeText(p, intArrayOf(0, 0, 0)))
         assertEquals("b:5000 did not release the speakers", Takeover.outcomeText(p, intArrayOf(2, 1, 2)))
         assertEquals("No other device answered", Takeover.outcomeText(p, intArrayOf(2, 2, 2)))
+        // Answered, but had nothing to give: named after those who refused.
+        assertEquals("a:5000 and b:5000 did not have the speakers", Takeover.outcomeText(p, intArrayOf(3, 3, 2)))
+        assertEquals("c:5000 did not release the speakers", Takeover.outcomeText(p, intArrayOf(3, 2, 1)))
+        assertEquals("b:5000 released the speakers", Takeover.outcomeText(p, intArrayOf(3, 0, 1)))
+    }
+
+    @Test
+    fun outcomeOfAnAnswer() {
+        assertEquals(0, Takeover.outcomeOf("200 {\"success\":true}"))
+        assertEquals(0, Takeover.outcomeOf("200 ok"))
+        // Let go already, or still looking: nothing to give.
+        assertEquals(3, Takeover.outcomeOf("200 {\"held\":false,\"success\":true}"))
+        assertEquals(3, Takeover.outcomeOf("200 {\"held\": false, \"success\": true}"))
+        assertEquals(3, Takeover.outcomeOf("409 {\"error\":\"This device does not hold the speakers\",\"success\":false}"))
+        assertEquals(1, Takeover.outcomeOf("501 {\"success\":false}"))
+        assertEquals(1, Takeover.outcomeOf("404 page not found"))
     }
 
     @Test
@@ -188,5 +204,116 @@ class TakeoverTest {
         takeover.newSession()
         advance(3_600_000)
         assertEquals(listOf("desk:5000", "desk:5000"), calls)
+    }
+
+    @Test
+    fun quietSessionAsksNoKnownPeer() {
+        takeover.quietSession()
+        advance(0)
+        advance(timeout * 5)
+        assertEquals(emptyList<String>(), calls)
+        // A peer added since is still asked once the speakers do not show up.
+        peers = listOf("desk:5000", "den:2407")
+        advance(timeout)
+        assertEquals(listOf("den:2407"), calls)
+    }
+
+    @Test
+    fun quietSessionStaysQuietAfterTheSpeakersAreLostAgain() {
+        takeover.quietSession()
+        connected = true
+        advance(0)
+        connected = false
+        advance(0)
+        advance(timeout * 5)
+        assertEquals(emptyList<String>(), calls)
+    }
+
+    @Test
+    fun anOpeningAfterAQuietSessionAsksAtOnce() {
+        takeover.quietSession()
+        advance(timeout)
+        takeover.newSession()
+        advance(0)
+        assertEquals(listOf("desk:5000"), calls)
+    }
+
+    /** A takeover whose peers tell their phase first; "desk" let go already. */
+    private fun checking(phases: Map<String, String?>, gone: Set<String> = emptySet()) = Takeover(
+        peers = { peers },
+        connected = { connected },
+        post = { peer ->
+            calls.add(peer)
+            "200 {\"success\":true}" // as versions before "held" answer, also when let go already
+        },
+        log = { log.add(it) },
+        note = { notes.add(it) },
+        phase = { peer -> if (peer in gone) throw IOException("connection refused") else phases[peer] },
+    )
+
+    @Test
+    fun peerThatLetGoAlreadyIsNotAsked() {
+        peers = listOf("desk:5000", "den:2407")
+        val t = checking(mapOf("desk:5000" to "released", "den:2407" to "connected"))
+        t.check(now)
+        assertEquals(listOf("den:2407"), calls)
+        assertEquals("den:2407 released the speakers", notes.last())
+        assertTrue(log.contains("Other devices: desk:5000 had let go of the speakers already, not asked"))
+    }
+
+    @Test
+    fun aloneItHadNothingToGive() {
+        peers = listOf("desk:5000")
+        checking(mapOf("desk:5000" to "released")).check(now)
+        assertEquals(emptyList<String>(), calls)
+        assertEquals("desk:5000 did not have the speakers", notes.last())
+    }
+
+    @Test
+    fun unknownPhaseStillAsks() {
+        peers = listOf("desk:5000")
+        checking(mapOf("desk:5000" to null)).check(now)
+        assertEquals(listOf("desk:5000"), calls)
+    }
+
+    @Test
+    fun unreachableIsNotAskedTwice() {
+        peers = listOf("desk:5000")
+        checking(emptyMap(), gone = setOf("desk:5000")).check(now)
+        assertEquals(emptyList<String>(), calls)
+        assertEquals("desk:5000 did not answer", notes.last())
+    }
+
+    @Test
+    fun phaseOfAStatus() {
+        assertEquals("released", Takeover.phaseOf("{\"connected\":false,\"note\":\"\",\"phase\":\"released\",\"problem\":\"\",\"volume\":50}"))
+        assertEquals("connected", Takeover.phaseOf("{\"phase\": \"connected\"}"))
+        assertEquals(null, Takeover.phaseOf("{\"success\":true}"))
+        assertEquals(null, Takeover.phaseOf("404 page not found"))
+    }
+
+    @Test
+    fun aRoundEndsOnTimeAlsoWhenAPeerHangs() {
+        peers = listOf("desk:5000", "attic:5000")
+        val hang = java.util.concurrent.CountDownLatch(1)
+        val t = Takeover(
+            peers = { peers },
+            connected = { connected },
+            post = { peer ->
+                if (peer == "attic:5000") hang.await() // never answers in time
+                "200 {\"success\":true}"
+            },
+            log = { log.add(it) },
+            note = { notes.add(it) },
+            phase = { "connected" },
+            peerTimeoutMillis = 200,
+        )
+        val started = System.nanoTime()
+        t.check(now)
+        val tookMillis = (System.nanoTime() - started) / 1_000_000
+        hang.countDown()
+        assertTrue("took $tookMillis ms", tookMillis in 150..1_000)
+        assertEquals("desk:5000 released the speakers", notes.last())
+        assertTrue(log.contains("Other devices: attic:5000 did not answer within 200 ms"))
     }
 }

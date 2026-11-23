@@ -147,6 +147,13 @@ class SpeakerManagerTest {
     }
 
     @Test
+    fun speakersNotFoundIsNamedAsThePageExpects() {
+        // The page offers "Ask devices" on exactly this text, as with the desktop app.
+        val r = start(Dialer { throw NotFoundException() })
+        eventually("problem") { r.manager.status().problem == "Speakers not found" }
+    }
+
+    @Test
     fun failedHandshakeIsNamed() {
         val r = start(FakeDialer(prepare = { link, _ -> link.writeError = IOException("nope") }))
         eventually("problem") { r.manager.status().problem == SpeakerManager.PROBLEM_NO_ANSWER }

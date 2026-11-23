@@ -20,6 +20,7 @@ import android.os.ParcelUuid
 import io.github.mp3cko.z407.core.Dialer
 import io.github.mp3cko.z407.core.Link
 import io.github.mp3cko.z407.core.LinkEvents
+import io.github.mp3cko.z407.core.NotFoundException
 import io.github.mp3cko.z407.core.Protocol
 import java.io.IOException
 import java.util.UUID
@@ -88,7 +89,7 @@ class BleDialer(context: Context) : Dialer {
             return when (val r = found.poll(SCAN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                 is BluetoothDevice -> r
                 is IOException -> throw r
-                else -> throw IOException("Z407 speaker not found")
+                else -> throw NotFoundException()
             }
         } finally {
             try {

@@ -26,5 +26,8 @@ class SummaryTest {
         assertEquals(Summary("Not connected", "Waiting for the next attempt"), Summary.of(Status(false, 50), released = false))
         // Released wins over whatever the manager still reports.
         assertEquals("Disconnected", Summary.of(Status(true, 55), released = true).title)
+        // Screen off: the speakers were let go of; released still wins.
+        assertEquals("Released while the screen is off", Summary.of(Status(false, 55), released = false, asleep = true).title)
+        assertEquals("Disconnected", Summary.of(Status(false, 55), released = true, asleep = true).title)
     }
 }
